@@ -58,6 +58,10 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Query(value = "SELECT id FROM notifications WHERE status = 'SCHEDULED' AND scheduled_at <= :now", nativeQuery = true)
     List<UUID> findDueScheduledIds(@Param("now") Instant now);
 
+    @Modifying
+    @Query(value = "UPDATE notifications SET lease_expires_at = :until WHERE id = :id AND status = 'PROCESSING' AND leased_by = :worker", nativeQuery = true)
+    int extendLease(@Param("id") UUID id, @Param("worker") String worker, @Param("until") Instant until);
+
     @Query(value = "SELECT id FROM notifications WHERE status = 'PROCESSING' AND lease_expires_at < :now", nativeQuery = true)
     List<UUID> findExpiredLeases(@Param("now") Instant now);
 

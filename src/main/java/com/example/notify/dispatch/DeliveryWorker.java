@@ -28,6 +28,9 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Executes one leased notification. Three phases:
@@ -42,7 +45,7 @@ import java.util.UUID;
 public class DeliveryWorker {
     private static final Logger log = LoggerFactory.getLogger(DeliveryWorker.class);
     static final String ACTOR = "dispatcher";
-
+    private static final ScheduledExecutorService HEARTBEAT = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon().name("lease-heartbeat").factory());
     private final NotificationRepository notifications;
     private final DeliveryAttemptRepository attempts;
     private final ChannelConfigRepository channelConfigs;
@@ -53,11 +56,12 @@ public class DeliveryWorker {
     private final WorkerIdentity worker;
     private final TransactionTemplate tx;
     private final Clock clock;
+    private final Duration lease;
 
     public DeliveryWorker(NotificationRepository notifications, DeliveryAttemptRepository attempts,
                           ChannelConfigRepository channelConfigs, TenantRepository tenants,
                           ChannelProviderRegistry providers, NotificationAuditor auditor,
-                          ExponentialBackoffPolicy backoff, WorkerIdentity worker, TransactionTemplate tx, Clock clock) {
+                          ExponentialBackoffPolicy backoff, WorkerIdentity worker, TransactionTemplate tx, Clock clock, DispatchProperties props) {
         this.notifications = notifications;
         this.attempts = attempts;
         this.channelConfigs = channelConfigs;
@@ -68,6 +72,7 @@ public class DeliveryWorker {
         this.worker = worker;
         this.tx = tx;
         this.clock = clock;
+        this.lease = props.leaseDuration();
     }
 
     private record Prepared(DeliveryRequest request, ChannelProvider provider) {}
@@ -96,7 +101,12 @@ public class DeliveryWorker {
             tx.executeWithoutResult(s -> complete(notificationId, prepared, invoke(prepared), started));
             return;
         }
-        outcome = invoke(prepared);
+        var heartbeat = HEARTBEAT.scheduleAtFixedRate(() -> extendLease(notificationId), lease.toMillis()/3, lease.toMillis()/3, TimeUnit.MILLISECONDS);
+        try {
+            outcome = invoke(prepared);
+        } finally {
+            heartbeat.cancel(false);
+        }
         Outcome finalOutcome = outcome;
         tx.executeWithoutResult(s -> complete(notificationId, prepared, finalOutcome, started));
     }
@@ -108,6 +118,14 @@ public class DeliveryWorker {
                 requeue(n, NotificationEvent.Type.REQUEUED, reason, Duration.ZERO);
             }
         }));
+    }
+
+    private void extendLease(UUID id) {
+        try {
+            tx.executeWithoutResult(s -> notifications.extendLease(id, worker.id(), clock.instant().plus(lease)));
+        } catch (RuntimeException e) {
+            log.warn("Lease HearBeat failed for []", id, e);
+        }
     }
 
     private Outcome invoke(Prepared p) {
